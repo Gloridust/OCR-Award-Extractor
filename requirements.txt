@@ -1,0 +1,6 @@
+torch
+transformers
+paddleocr
+opencv-python
+numpy
+jieba
