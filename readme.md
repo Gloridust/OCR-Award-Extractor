@@ -37,8 +37,8 @@
 1. 克隆仓库或下载源代码:
 
 ```bash
-git clone [仓库URL]
-cd [项目目录]
+git clone https://github.com/Gloridust/OCR-Award-Extractor.git
+cd OCR-Award-Extractor
 ```
 
 2. 安装依赖项:
