@@ -3,3 +3,4 @@ paddleocr>=2.6.0
 torch>=1.12.0
 opencv-python>=4.6.0
 numpy>=1.23.0
+modelscope>=1.24.0

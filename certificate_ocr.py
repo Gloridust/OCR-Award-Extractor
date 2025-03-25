@@ -5,9 +5,10 @@ import numpy as np
 import logging
 from paddleocr import PaddleOCR
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+from modelscope import AutoModelForCausalLM, AutoTokenizer
 import re
 from pathlib import Path
+import argparse
 
 # 配置日志记录
 logging.basicConfig(level=logging.INFO, 
@@ -15,16 +16,18 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 class CertificateOCR:
-    def __init__(self, img_dir="data/img/", result_dir="data/result/"):
+    def __init__(self, img_dir="data/img/", result_dir="data/result/", use_llm=True):
         """
         初始化 CertificateOCR 类
         
         Args:
             img_dir (str): 包含证书图像的目录
             result_dir (str): 保存 JSON 结果的目录
+            use_llm (bool): 是否使用大语言模型
         """
         self.img_dir = img_dir
         self.result_dir = result_dir
+        self.use_llm = use_llm
         
         # 创建目录（如果不存在）
         Path(img_dir).mkdir(parents=True, exist_ok=True)
@@ -34,6 +37,24 @@ class CertificateOCR:
         logger.info("正在初始化 PaddleOCR...")
         self.ocr = PaddleOCR(use_angle_cls=True, lang="ch", 
                              use_gpu=torch.cuda.is_available())
+        
+        # 初始化大语言模型
+        self.llm_available = False
+        if use_llm:
+            logger.info("正在初始化大语言模型...")
+            try:
+                model_name = "Qwen/Qwen2.5-Coder-7B-Instruct"
+                self.llm_model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype="auto",
+                    device_map="auto"
+                )
+                self.llm_tokenizer = AutoTokenizer.from_pretrained(model_name)
+                self.llm_available = True
+                logger.info("大语言模型初始化成功")
+            except Exception as e:
+                logger.error(f"大语言模型初始化失败: {e}")
+                logger.warning("将使用备用简单提取方法")
     
     def enhance_image(self, image):
         """
@@ -127,348 +148,239 @@ class CertificateOCR:
         # 合并所有文本，保留适当的换行符
         full_text = "\n".join(text_lines)
         
-        # 从文本中提取结构化信息
-        certificate_info = self.extract_information(full_text, text_lines)
+        # 使用大语言模型提取结构化信息
+        if self.llm_available:
+            certificate_info = self.extract_with_llm(full_text)
+        else:
+            # 如果大语言模型不可用，使用备用提取方法
+            certificate_info = self.simple_fallback_extract(full_text, text_lines)
         
         # 准备结果
         json_result = {
             "status": "success",
             "certificate_info": certificate_info,
             "ocr_confidence": round(avg_confidence, 4),
-            "image_path": image_path
+            "image_path": image_path,
+            "ocr_text": full_text  # 添加OCR识别的原始文本
         }
         
         return json_result
     
-    def extract_competition_name(self, text, text_lines):
+    def extract_with_llm(self, text):
         """
-        提取竞赛名称
+        使用大语言模型从OCR文本中提取结构化信息
         
         Args:
-            text (str): 完整文本
-            text_lines (list): 单独文本行列表
+            text (str): OCR提取的文本
             
         Returns:
-            str: 提取的竞赛名称
+            dict: 结构化的证书信息
         """
-        # 竞赛名称模式
-        competition_patterns = [
-            r"第[\u4e00-\u9fa5\d]+届[\u4e00-\u9fa5\d]+(?:大学生|青年|全国|国际)?[\u4e00-\u9fa5\d]+(?:大赛|比赛|竞赛|创新创业大赛|创客大赛|挑战赛)",
-            r"[\u4e00-\u9fa5\d]+(?:大学生|青年|全国|国际)?[\u4e00-\u9fa5\d]+(?:大赛|比赛|竞赛|创新创业大赛|创客大赛|挑战赛)",
-            r"(?:大学生|青年|全国|国际)[\u4e00-\u9fa5\d]+(?:大赛|比赛|竞赛|创新创业大赛|创客大赛|挑战赛)"
-        ]
-        
-        for pattern in competition_patterns:
-            matches = re.findall(pattern, text)
-            if matches:
-                # 按长度排序以获取最完整的匹配
-                matches.sort(key=len, reverse=True)
-                return matches[0]
+        try:
+            # 构建提示词
+            prompt = f"""
+你是一位专业的证书信息提取助手。请帮我从以下证书文本中提取关键信息。
+请严格按照JSON格式输出以下字段:
+1. competition_name: 竞赛名称
+2. award_level: 奖项级别（如一等奖、二等奖、金奖等）
+3. project_name: 项目名称
+4. people: 包含两个列表
+   - winner: 获奖者姓名列表
+   - teacher: 指导教师姓名列表
+
+以下是证书的OCR识别文本:
+```
+{text}
+```
+
+只输出JSON格式结果，不要包含任何解释。遵循以下格式：
+{{
+  "competition_name": "竞赛名称",
+  "award_level": "奖项级别",
+  "project_name": "项目名称",
+  "people": {{
+    "winner": ["获奖者1", "获奖者2", ...],
+    "teacher": ["指导教师1", "指导教师2", ...]
+  }}
+}}
+
+如果某个字段无法提取，请将其设置为空字符串或空列表。
+请全面分析证书文本，识别竞赛名称时注意查找包含"大赛"、"比赛"、"竞赛"、"挑战赛"等关键词的完整名称；识别奖项级别时注意查找包含"等奖"、"金奖"、"银奖"等级别词语；识别项目名称时注意引号内的文本或带有连字符的标题；识别人员时区分获奖者和指导教师。
+"""
+
+            # 使用大语言模型分析文本
+            messages = [
+                {"role": "system", "content": "你是一个专业的证书信息提取助手，擅长结构化分析OCR文本并以JSON格式输出。"},
+                {"role": "user", "content": prompt}
+            ]
+            
+            text_input = self.llm_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            model_inputs = self.llm_tokenizer([text_input], return_tensors="pt").to(self.llm_model.device)
+            
+            generated_ids = self.llm_model.generate(
+                **model_inputs,
+                max_new_tokens=1024,
+                temperature=0.1,  # 使用较低的温度以获得更确定的输出
+                do_sample=False   # 禁用采样以获得确定性输出
+            )
+            
+            generated_ids = [
+                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+            ]
+            
+            response = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            
+            # 尝试从响应中提取JSON部分
+            json_matches = re.findall(r'```json\s*(.*?)\s*```', response, re.DOTALL)
+            if json_matches:
+                json_str = json_matches[0]
+            else:
+                # 尝试查找JSON对象，假设它是以{开始，以}结束的
+                json_matches = re.findall(r'({.*})', response, re.DOTALL)
+                if json_matches:
+                    json_str = json_matches[0]
+                else:
+                    json_str = response
+            
+            # 从响应中解析JSON
+            try:
+                result = json.loads(json_str)
+                # 格式验证和修复
+                result = self.validate_and_fix_result(result)
+                logger.info("LLM成功提取信息")
+                return result
+            except json.JSONDecodeError as e:
+                logger.error(f"LLM返回的JSON无效: {e}")
+                logger.error(f"原始响应: {response}")
+                # 使用简单提取方法作为后备方案
+                return self.simple_fallback_extract(text, text.split('\n'))
                 
-        # 如果未找到竞赛名称，检查可能包含竞赛名称的单独行
-        for line in text_lines:
-            if any(keyword in line for keyword in ["大赛", "比赛", "竞赛", "挑战赛"]) and len(line) > 5 and len(line) < 40:
-                return line.strip()
-                
-        return ""
-        
-    def extract_award_level(self, text, text_lines):
+        except Exception as e:
+            logger.error(f"LLM提取过程中出错: {e}")
+            # 使用简单提取方法作为后备方案
+            return self.simple_fallback_extract(text, text.split('\n'))
+    
+    def validate_and_fix_result(self, result):
         """
-        提取奖项级别
+        验证并修复LLM返回的结果格式
         
         Args:
-            text (str): 完整文本
-            text_lines (list): 单独文本行列表
+            result (dict): LLM返回的结果
             
         Returns:
-            str: 提取的奖项级别
+            dict: 验证并修复后的结果
         """
-        # 奖项级别模式
-        award_patterns = [
-            r"[国省市区校](?:家|级|赛区)?(?:特等|一等|二等|三等|优秀|金|银|铜)?奖",
-            r"(?:特等|一等|二等|三等|金|银|铜)奖",
-            r"(?:优秀|突出贡献)奖",
-            r"(?:第[一二三]名)"
-        ]
+        # 确保所有必要的键都存在
+        expected_keys = ["competition_name", "award_level", "project_name", "people"]
+        for key in expected_keys:
+            if key not in result:
+                result[key] = "" if key != "people" else {"winner": [], "teacher": []}
         
-        for pattern in award_patterns:
-            matches = re.findall(pattern, text)
-            if matches:
-                # 使用最长的匹配
-                matches.sort(key=len, reverse=True)
-                return matches[0]
-                
-        # 如果未找到奖项级别，检查单独行
-        for line in text_lines:
-            if "奖" in line and len(line) < 15:
-                return line.strip()
-                
-        return ""
+        # 确保people字典具有正确的结构
+        if "people" in result:
+            if not isinstance(result["people"], dict):
+                result["people"] = {"winner": [], "teacher": []}
+            else:
+                if "winner" not in result["people"]:
+                    result["people"]["winner"] = []
+                if "teacher" not in result["people"]:
+                    result["people"]["teacher"] = []
         
-    def extract_project_name(self, text, text_lines):
+        # 确保字符串字段确实是字符串
+        for key in ["competition_name", "award_level", "project_name"]:
+            if not isinstance(result[key], str):
+                result[key] = str(result[key]) if result[key] is not None else ""
+        
+        # 确保列表字段确实是列表
+        for key in ["winner", "teacher"]:
+            if not isinstance(result["people"][key], list):
+                result["people"][key] = [result["people"][key]] if result["people"][key] else []
+        
+        # 清除可能的重复项
+        result["people"]["winner"] = list(set(result["people"]["winner"]))
+        result["people"]["teacher"] = list(set(result["people"]["teacher"]))
+        
+        # 确保列表中的所有项都是字符串
+        result["people"]["winner"] = [str(item) for item in result["people"]["winner"] if item]
+        result["people"]["teacher"] = [str(item) for item in result["people"]["teacher"] if item]
+        
+        return result
+    
+    def simple_fallback_extract(self, full_text, text_lines):
         """
-        提取项目名称
+        使用简单关键词方法从OCR文本中提取结构化信息，作为大语言模型的备用方案
         
         Args:
-            text (str): 完整文本
-            text_lines (list): 单独文本行列表
+            full_text (str): 完整OCR文本
+            text_lines (list): 文本行列表
             
         Returns:
-            str: 提取的项目名称
+            dict: 结构化的证书信息
         """
-        # 项目名称模式
-        project_patterns = [
-            r"[《\"](.+?)[》\"]",  # 引号或特殊括号内的文本
-            r"(?:项目|作品|获奖项目|获奖作品|题目)[：:]\s*([\u4e00-\u9fa5a-zA-Z0-9\-_+（）\(\)]+)",
-            r"(.+?(?:-{1,2}|\s*[-—]\s*)[\u4e00-\u9fa5a-zA-Z0-9\-_+]+)"  # 项目名称通常包含连字符
-        ]
-        
-        for pattern in project_patterns:
-            matches = re.findall(pattern, text)
-            if matches:
-                # 使用不太长的最长匹配
-                valid_matches = [m for m in matches if isinstance(m, str) and 3 < len(m) < 50]
-                if valid_matches:
-                    valid_matches.sort(key=len, reverse=True)
-                    return valid_matches[0]
-        
-        # 检查以冒号结尾的模式，项目名称可能在下一行
-        for i, line in enumerate(text_lines):
-            if re.search(r"(?:项目|作品|获奖项目|获奖作品|题目)[：:]$", line) and i + 1 < len(text_lines):
-                return text_lines[i+1].strip()
-                
-        # 在许多证书中，如果一行包含"--"或"—"，它很可能是一个项目名称
-        for line in text_lines:
-            if "--" in line or "—" in line or "-" in line:
-                if len(line) > 5 and len(line) < 50 and not any(keyword in line for keyword in ["指导教师", "导师", "负责人"]):
-                    return line.strip()
-                    
-        return ""
-        
-    def extract_people(self, text, text_lines):
-        """
-        提取人员信息（获奖者和教师）
-        
-        Args:
-            text (str): 完整文本
-            text_lines (list): 单独文本行列表
-            
-        Returns:
-            dict: 包含获奖者和教师的字典
-        """
-        people = {
-            "winner": [],
-            "teacher": []
+        # 初始化结果结构
+        info = {
+            "competition_name": "",
+            "award_level": "",
+            "project_name": "",
+            "people": {
+                "winner": [],
+                "teacher": []
+            }
         }
         
-        # 识别名单的模式
-        winner_patterns = [
-            r"(?:获奖学生|负责人|队员|参赛者|作者|获奖人|学生|成员)[：:]\s*(.*)",
-            r"(?:获奖学生|负责人|队员|参赛者|作者|获奖人|学生|成员)[：:]\s*$"
-        ]
+        competition_keywords = ["大赛", "比赛", "竞赛", "挑战赛"]
+        award_keywords = ["一等奖", "二等奖", "三等奖", "特等奖", "金奖", "银奖", "铜奖", "优秀奖"]
         
-        teacher_patterns = [
-            r"(?:指导教师|导师|辅导教师|指导老师|指导员)[：:]\s*(.*)",
-            r"(?:指导教师|导师|辅导教师|指导老师|指导员)[：:]\s*$"
-        ]
-        
-        # 处理每一行以提取人员
-        winner_section = False
-        teacher_section = False
-        
-        for i, line in enumerate(text_lines):
-            # 标记部分开始
-            if re.search(r"(?:获奖学生|负责人|队员|参赛者|作者|获奖人|学生|成员)[：:]", line):
-                winner_section = True
-                teacher_section = False
-            elif re.search(r"(?:指导教师|导师|辅导教师|指导老师|指导员)[：:]", line):
-                teacher_section = True
-                winner_section = False
-            
-            # 检查获奖者模式
-            for pattern in winner_patterns:
-                match = re.search(pattern, line)
-                if match:
-                    if match.group(1) and len(match.group(1).strip()) > 0:
-                        # 从这一行提取名字
-                        names = self.extract_names(match.group(1))
-                        people["winner"].extend(names)
-                    elif i + 1 < len(text_lines) and not any(keyword in text_lines[i+1] for keyword in ["指导教师", "导师", "辅导教师", "指导老师"]):
-                        # 名字可能在下一行
-                        names = self.extract_names(text_lines[i+1])
-                        people["winner"].extend(names)
-                    break
-            
-            # 如果当前在获奖者部分，且当前行可能是名字列表
-            if winner_section and not teacher_section and len(line.strip()) > 0:
-                if self.is_name_list(line):
-                    names = self.extract_names(line)
-                    people["winner"].extend(names)
-            
-            # 检查教师模式
-            if not winner_section:  # 确保不在获奖者部分时才检查教师模式
-                for pattern in teacher_patterns:
-                    match = re.search(pattern, line)
-                    if match:
-                        if match.group(1) and len(match.group(1).strip()) > 0:
-                            # 从这一行提取名字
-                            names = self.extract_names(match.group(1))
-                            people["teacher"].extend(names)
-                        elif i + 1 < len(text_lines):
-                            # 名字可能在下一行
-                            names = self.extract_names(text_lines[i+1])
-                            people["teacher"].extend(names)
-                        break
-            
-            # 如果当前在教师部分，且当前行可能是名字列表
-            if teacher_section and len(line.strip()) > 0:
-                if self.is_name_list(line):
-                    names = self.extract_names(line)
-                    people["teacher"].extend(names)
-        # 如果以上基于部分的提取失败，尝试基于位置的提取
-        if not people["winner"] and not people["teacher"]:
-            for line in text_lines:
-                # 先查找负责人/获奖学生
-                if "负责人" in line and "：" in line:
-                    parts = line.split("：")
-                    if len(parts) > 1 and parts[1].strip():
-                        name = parts[1].strip()
-                        if self.is_valid_name(name):
-                            people["winner"].append(name)
-                
-                # 检查这一行是否可能是名字列表
-                elif len(line.strip()) > 0 and len(line.strip()) < 20:
-                    names = self.extract_names(line)
-                    
-                    if names:
-                        # 判断是否是教师名字
-                        if any(teacher_kw in text for teacher_kw in ["指导教师", "导师"]) and len(people["teacher"]) == 0:
-                            people["teacher"].extend(names)
-                        else:
-                            people["winner"].extend(names)
-                    
-        # 从"获奖学生"部分提取名字
+        # 简单检测竞赛名称 - 包含关键词的最长行
+        competition_lines = []
         for line in text_lines:
-            if "获奖学生：" in line:
-                student_part = line.split("获奖学生：")[1].strip()
-                student_names = self.extract_names(student_part)
-                people["winner"].extend(student_names)
-                
-        # 删除重复项和非名字项
-        people["winner"] = [name for name in list(set(people["winner"])) if self.is_valid_name(name)]
-        people["teacher"] = [name for name in list(set(people["teacher"])) if self.is_valid_name(name)]
+            if any(keyword in line for keyword in competition_keywords):
+                competition_lines.append(line)
         
-        return people
+        if competition_lines:
+            info["competition_name"] = max(competition_lines, key=len)
         
-    def is_name_list(self, text):
-        """
-        检查文本行是否可能是名字列表
+        # 简单检测奖项级别 - 包含关键词的行
+        for line in text_lines:
+            for keyword in award_keywords:
+                if keyword in line:
+                    info["award_level"] = keyword
+                    break
+            if info["award_level"]:
+                break
         
-        Args:
-            text (str): 文本行
+        # 简单检测项目名称 - 查找引号内的内容
+        project_matches = re.findall(r'[《""](.+?)[》""]', full_text)
+        if project_matches:
+            info["project_name"] = project_matches[0]
+        
+        # 简单检测人员信息
+        for i, line in enumerate(text_lines):
+            # 检测获奖者
+            if "获奖学生" in line or "负责人" in line or "队员" in line or "获奖者" in line:
+                parts = line.split("：")
+                if len(parts) > 1 and parts[1].strip():
+                    names = re.split(r'[、，,；;]', parts[1])
+                    info["people"]["winner"].extend([n.strip() for n in names if n.strip()])
             
-        Returns:
-            bool: 如果可能是名字列表则为 True
-        """
-        # 排除常见的非名字文本
-        non_name_keywords = [
-            "负责人", "指导教师", "导师", "指导老师", "获奖学生", "队员", "参赛者", 
-            "作者", "获奖人", "学生", "成员", "年", "月", "日", "二零", "学院"
-        ]
+            # 检测教师
+            if "指导教师" in line or "导师" in line:
+                parts = line.split("：")
+                if len(parts) > 1 and parts[1].strip():
+                    names = re.split(r'[、，,；;]', parts[1])
+                    info["people"]["teacher"].extend([n.strip() for n in names if n.strip()])
         
-        # 检查是否包含非名字关键词作为独立词语
-        for keyword in non_name_keywords:
-            if keyword == text.strip():
-                return False
+        # 清理文本
+        info["competition_name"] = self.clean_text(info["competition_name"])
+        info["award_level"] = self.clean_text(info["award_level"])
+        info["project_name"] = self.clean_text(info["project_name"])
         
-        # 中文名字通常是 2-4 个字符
-        name_pattern = r"[\u4e00-\u9fa5]{2,4}"
-        
-        # 名字列表中的常见分隔符
-        separator_pattern = r"[、，,；;]"
-        
-        # 检查文本是否包含由常见分隔符分隔的多个名字
-        names = re.findall(f"{name_pattern}(?:{separator_pattern}|$)", text)
-        
-        # 确保找到的名字不是上面列表中的关键词
-        filtered_names = [name for name in names if name not in non_name_keywords]
-        
-        return len(filtered_names) > 0 and len(filtered_names) * 4 >= len(text) * 0.5
-        
-    def extract_names(self, text):
-        """
-        从文本字符串中提取名字
-        
-        Args:
-            text (str): 包含名字的文本
-            
-        Returns:
-            list: 提取的名字列表
-        """
-        if not text or len(text.strip()) == 0:
-            return []
-            
-        # 删除不是名字的常见前缀和后缀
-        text = re.sub(r"(?:教授|老师|博士|硕士|先生|女士|同学)$", "", text)
-        
-        # 检查常见分隔符
-        if any(sep in text for sep in ["、", "，", ",", "；", ";"]):
-            # 按分隔符拆分
-            parts = re.split(r"[、，,；;]", text)
-            # 清理每个部分
-            names = [part.strip() for part in parts if self.is_valid_name(part.strip())]
-            return names
-        else:
-            # 检查文本是否是单个名字
-            if self.is_valid_name(text.strip()):
-                return [text.strip()]
-            else:
-                # 尝试使用模式匹配提取名字
-                name_pattern = r"[\u4e00-\u9fa5]{2,4}"
-                names = re.findall(name_pattern, text)
-                return [name for name in names if self.is_valid_name(name)]
-    
-    def is_valid_name(self, text):
-        """
-        检查字符串是否可能是有效的中文名字
-        
-        Args:
-            text (str): 要检查的文本
-            
-        Returns:
-            bool: 如果可能是名字则为 True
-        """
-        # 中文名字通常是 2-4 个字符
-        if not text or not text.strip():
-            return False
-            
-        text = text.strip()
-        
-        # 检查长度
-        if not (2 <= len(text) <= 4):
-            return False
-            
-        # 检查是否只包含中文字符
-        if not re.match(r"^[\u4e00-\u9fa5]+$", text):
-            return False
-            
-        # 排除明显不是名字的词语
-        non_name_keywords = [
-            "负责人", "指导教师", "导师", "指导老师", "获奖学生", "队员", "参赛者", 
-            "作者", "获奖人", "学生", "成员", "年", "月", "日", "二零", "学院",
-            "证书", "奖状", "二零二四", "年出月", "年出月院"
-        ]
-        
-        if text in non_name_keywords:
-            return False
-            
-        # 排除只包含数字的中文字符（如"二零二四"）
-        chinese_digits = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
-        if all(char in chinese_digits for char in text):
-            return False
-            
-        # 如果所有测试都通过但我们不确定，倾向于接受它
-        return True
+        return info
     
     def clean_text(self, text):
         """
@@ -493,42 +405,6 @@ class CertificateOCR:
         text = re.sub(r"^[\"\'《](.+?)[\"\'》]$", r"\1", text).strip()
         
         return text
-    
-    def extract_information(self, full_text, text_lines):
-        """
-        从证书文本中提取结构化信息
-        
-        Args:
-            full_text (str): 合并的 OCR 文本
-            text_lines (list): 单独文本行列表
-            
-        Returns:
-            dict: 结构化的证书信息
-        """
-        # 初始化结果结构
-        info = {
-            "competition_name": "",
-            "award_level": "",
-            "project_name": "",
-            "people": {
-                "winner": [],
-                "teacher": []
-            }
-        }
-        
-        # 提取每个组件
-        info["competition_name"] = self.clean_text(self.extract_competition_name(full_text, text_lines))
-        info["award_level"] = self.clean_text(self.extract_award_level(full_text, text_lines))
-        info["project_name"] = self.clean_text(self.extract_project_name(full_text, text_lines))
-        info["people"] = self.extract_people(full_text, text_lines)
-        
-        # 确保获奖者和教师之间没有重叠
-        common_names = set(info["people"]["winner"]) & set(info["people"]["teacher"])
-        if common_names:
-            # 如果名字出现在两个列表中，只保留在获奖者中
-            info["people"]["teacher"] = [name for name in info["people"]["teacher"] if name not in common_names]
-        
-        return info
     
     def process_all_images(self):
         """
@@ -569,7 +445,16 @@ class CertificateOCR:
 
 def main():
     """主程序入口点"""
-    ocr = CertificateOCR()
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='证书OCR信息提取工具')
+    parser.add_argument('--img_dir', type=str, default="data/img/", help='包含证书图像的目录路径')
+    parser.add_argument('--result_dir', type=str, default="data/result/", help='保存结果的目录路径')
+    parser.add_argument('--no_llm', action='store_true', help='不使用大语言模型，而是使用简单关键词提取方法')
+    
+    args = parser.parse_args()
+    
+    # 创建OCR处理器实例，默认启用大语言模型
+    ocr = CertificateOCR(img_dir=args.img_dir, result_dir=args.result_dir, use_llm=not args.no_llm)
     results = ocr.process_all_images()
     
     # 记录摘要
